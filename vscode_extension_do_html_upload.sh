@@ -69,7 +69,7 @@ cat <<EOL > package.json
   "icon": "media/logo.png",
   "version": "1.0.0",
   "engines": {
-    "vscode": "^1.96.0"
+    "vscode": "^1.81.0"
   },
   "categories": [
     "Other"
@@ -159,7 +159,7 @@ cat <<EOL > package.json
   },
   "devDependencies": {
     "@types/node": "20.x",
-    "@types/vscode": "^1.96.0",
+    "@types/vscode": "^1.81.0",
     "typescript": "^5.7.2"
   },
   "dependencies": {
@@ -193,7 +193,7 @@ EOL
 cat <<'EOL' > src/extension.ts
 import { readFileSync } from "fs";
 import * as vscode from "vscode";
-
+import * as https from "https";
 
 export function activate(context: vscode.ExtensionContext) {
     console.log('✅ Digital Ocean Spaces HTML Uploader activated!');
@@ -287,7 +287,8 @@ export function activate(context: vscode.ExtensionContext) {
                 
                 try {
                   // Dynamically import AWS SDK to avoid compilation issues
-                  const { PutObjectCommand, S3Client } = await import('@aws-sdk/client-s3');
+                  const s3Module = require('@aws-sdk/client-s3');
+                  const { PutObjectCommand, S3Client } = s3Module;
                   
                   // Show progress
                   await vscode.window.withProgress({
@@ -366,10 +367,9 @@ export function activate(context: vscode.ExtensionContext) {
                           vscode.window.showInformationMessage(`✅ HTML file uploaded successfully (private)`);
                       }
 
-                      // Attempt CDN purge (optional)
+                      // Attempt CDN purge (optional) - only show warning on failure
                       if (apiToken && cdnId) {
                           try {
-                              const https = await import("https");
                               const purgeBody = JSON.stringify({ files: [key] });
 
                               await new Promise((resolve, reject) => {
@@ -380,16 +380,33 @@ export function activate(context: vscode.ExtensionContext) {
                                       headers: {
                                           "Authorization": `Bearer ${apiToken}`,
                                           "Content-Type": "application/json",
-                                          "Content-Length": purgeBody.length
+                                          "Content-Length": Buffer.byteLength(purgeBody).toString()
                                       }
-                                  }, (res) => res.statusCode === 204 ? resolve(true) : reject(res.statusCode));
+                                  }, (res) => {
+                                      let responseData = '';
+                                      res.on('data', (chunk) => {
+                                          responseData += chunk;
+                                      });
+                                      
+                                      res.on('end', () => {
+                                          if (res.statusCode === 204 || res.statusCode === 200) {
+                                              resolve(true);
+                                          } else {
+                                              reject(new Error(`CDN purge failed with status ${res.statusCode}: ${responseData}`));
+                                          }
+                                      });
+                                  });
+                                  
+                                  req.on('error', (error) => {
+                                      reject(error);
+                                  });
+                                  
                                   req.write(purgeBody);
                                   req.end();
                               });
-
-                              console.log("✅ CDN cache purged");
-                          } catch {
-                              console.warn("⚠️ CDN purge failed (upload still succeeded)");
+                          } catch (error: any) {
+                              // Only show warning if CDN purge fails
+                              vscode.window.showWarningMessage(`⚠️ CDN purge failed: ${error.message}`);
                           }
                       }
                       
@@ -429,10 +446,8 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(disposable);
 }
 
-// ✅ Auto-fetch CDN ID (added helper, no other logic touched)
+// ✅ Auto-fetch CDN ID
 async function getCdnId(apiToken: string, bucket: string): Promise<string | null> {
-    const https = await import("https");
-
     return new Promise((resolve) => {
         const req = https.request({
             method: "GET",
@@ -444,11 +459,12 @@ async function getCdnId(apiToken: string, bucket: string): Promise<string | null
             res.on("data", chunk => data += chunk);
             res.on("end", () => {
                 try {
-                    const endpoints = JSON.parse(data).endpoints;
+                    const response = JSON.parse(data);
+                    const endpoints = response.endpoints || [];
                     const match = endpoints.find((ep: any) =>
-                        ep.origin.startsWith(bucket + ".")
+                        ep.origin?.startsWith(bucket + ".")
                     );
-                    resolve(match?.id ?? null);
+                    resolve(match?.id || null);
                 } catch {
                     resolve(null);
                 }
